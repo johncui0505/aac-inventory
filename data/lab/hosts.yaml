@@ -1,0 +1,14 @@
+---
+aci:
+  children:
+    apic:
+      hosts:
+        apic1:
+#          apic_host: "{{ lookup('ansible.builtin.env', 'APIC_HOST') }}"
+          apic_host: 10.50.223.164
+          ansible_connection: local
+#    mso:
+#      hosts:
+#        mso1:
+#          mso_host: "{{ lookup('ansible.builtin.env', 'MSO_HOST') }}"
+#          ansible_connection: local

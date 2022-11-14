@@ -1,0 +1,442 @@
+variables:
+  # Disable SSL verification for git
+  GIT_SSL_NO_VERIFY: "true"
+
+  BOOTSTRAP: 'false'
+  # APIC NAE Pre-Change Analysis
+  APIC_NAE_PCA: 'false'
+  # APIC Deploy Stages
+  APIC_SNAPSHOT: 'true'
+  APIC_DEPLOY: 'true'
+  FULL_APIC_DEPLOY: 'false' # If true always deploy everything (no diff)
+  # APIC Test Stages
+  TEST_APIC_DEPLOY: 'true'
+  FULL_APIC_TEST: 'false' # If true always test everything (no diff)
+
+  PY_COLORS: '1'
+  ANSIBLE_FORCE_COLOR: '1'
+
+  # Needed in order for after_script to catch the job status successfully
+  # see https://gitlab.com/gitlab-org/gitlab-runner/-/issues/27693 for details
+  FF_USE_LEGACY_KUBERNETES_EXECUTION_STRATEGY: "true"
+
+image: danischm/aac:0.4.0
+
+# These before and after scripts are automatically used by every job not having a before/after script defined
+default:
+  before_script:
+    - echo -e "\e[0Ksection_start:`date +%s`:before_script[collapsed=true]\r\e[0KExecuting before_script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - pip install iac-validate
+    - ansible-galaxy install -r requirements.yml
+    - echo -e "\e[0Ksection_end:`date +%s`:before_script\r\e[0K"
+  after_script:
+    # The pipeline_failure.txt file is used to signal if any job in the pipeline has failed
+    - >
+      if [ $CI_JOB_STATUS == 'failed' ]; then
+        echo "failed" > pipeline_failure.txt
+      fi
+
+stages:
+  - validate
+  - bootstrap
+  - render
+  - deploy
+  - test
+  - git update
+  - notify
+
+# Template for the validate jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.validate: &validate
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - set -o pipefail
+    - ansible-playbook -i data/lab/hosts.yaml apic_validate.yaml |& tee validate_output.txt
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+      - validate_output.txt
+    expire_in: 30 min
+    when: always
+
+validate (master branch):
+  stage: validate
+  <<: *validate
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+
+validate (feature branch):
+  stage: validate
+  <<: *validate
+  rules:
+    - if: $CI_COMMIT_BRANCH != "master" && ( $CI_PIPELINE_SOURCE != "tag" || $CI_PIPELINE_SOURCE != "merge_request_event")
+
+validate (PR):
+  stage: validate
+  <<: *validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+bootstrap (master branch):
+  stage: bootstrap
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - set -o pipefail
+    - ansible-playbook -i data/lab/hosts.yaml apic_bootstrap.yaml |& tee bootstrap_output.txt
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+      - bootstrap_output.txt
+    expire_in: 30 min
+    when: always
+  needs: ["validate (master branch)"]
+
+test bootstrap (master branch):
+  stage: bootstrap
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - set -o pipefail
+    - ansible-playbook -i data/lab/hosts.yaml test_apic_bootstrap.yaml |& tee test_apic_bootstrap_output.txt
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+      - test_apic_bootstrap_output.txt
+      - test_results/
+    expire_in: 30 min
+    when: always
+    reports:
+      junit: test_results/lab/apic1/bootstrap_xunit.xml
+  needs: ["validate (master branch)", "bootstrap (master branch)"]
+
+# Template for the render jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.render: &render
+  stage: render
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - set -o pipefail
+    - git clone --depth 1 --branch last_deploy https://10.50.223.165/aci-iac/aac-inventory.git previous/
+    - git clone https://10.50.223.165/aci-iac/aac-inventory-config.git
+    - 'echo "previous_inventory: ./previous/data/lab/" >> apic_render_vars.yaml'
+    - >
+      if [ "$FULL_APIC_DEPLOY" == "true" ]; then
+        'echo "apic_mode: all" >> apic_render_vars.yaml'
+      fi
+    - ansible-playbook -i data/lab/hosts.yaml -e @apic_render_vars.yaml apic_render.yaml |& tee render_output.txt
+    - >
+      if [ -d "./rendered" ]; then
+        /bin/cp -rf ./rendered/ ./aac-inventory-config/
+      fi
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+      - render_output.txt
+      - previous/
+      - rendered/
+      - aac-inventory-config/
+    expire_in: 30 min
+    when: always
+
+render apic (master branch):
+  <<: *render
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  needs: ["validate (master branch)"]
+
+render apic w. bootstrap (master branch):
+  <<: *render
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  needs: ["validate (master branch)"]
+
+render apic (PR):
+  <<: *render
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  needs: ["validate (PR)"]
+
+# Template for the deploy jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.deploy: &deploy
+  stage: deploy
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - set -o pipefail
+    - 'echo "previous_inventory: ./previous/data/lab/" >> apic_deploy_vars.yaml'
+    - >
+      if [ "$FULL_APIC_DEPLOY" == "true" ]; then
+        'echo "apic_mode: all" >> apic_deploy_vars.yaml'
+      fi
+    - ansible-playbook -i data/lab/hosts.yaml -e @apic_deploy_vars.yaml apic_deploy.yaml |& tee deploy_output.txt
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+      - deploy_output.txt
+    expire_in: 30 min
+    when: always
+
+deploy apic (master branch):
+  <<: *deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  dependencies:
+    - render apic (master branch)
+  needs: ["validate (master branch)", "render apic (master branch)"]
+
+deploy apic w. bootstrap (master branch):
+  <<: *deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  dependencies:
+    - render apic w. bootstrap (master branch)
+  needs: ["validate (master branch)", "render apic w. bootstrap (master branch)"]
+
+# Template for the apic test jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.test_apic: &test_apic
+  stage: test
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - export ANSIBLE_CONFIG=$(pwd)/ansible.cfg
+    - set -o pipefail
+    - 'echo "test_apic_deploy: $TEST_APIC_DEPLOY" >> apic_test_vars.yaml'
+    - 'echo "previous_inventory: ''./previous/data/lab/''" >> apic_test_vars.yaml'
+    - >
+      if [ "$FULL_APIC_TEST" == "true" ]; then
+        'echo "apic_mode: 'all'" >> apic_test_vars.yaml'
+      fi
+    - ansible-playbook -i data/lab/hosts.yaml -e @apic_test_vars.yaml apic_test.yaml |& tee test_output.txt
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+      - test_output.txt
+      - test_results/
+    expire_in: 30 min
+    when: always
+    reports:
+      junit: test_results/lab/apic1/xunit.xml
+
+test apic (master branch):
+  <<: *test_apic
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  dependencies:
+    - render apic (master branch)
+  needs: ["validate (master branch)", "render apic (master branch)", "deploy apic (master branch)"]
+
+test apic w. bootstrap (master branch):
+  <<: *test_apic
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  dependencies:
+    - render apic w. bootstrap (master branch)
+  needs: ["validate (master branch)", "render apic w. bootstrap (master branch)", "deploy apic w. bootstrap (master branch)"]
+
+# Template for the GIT config update jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.git_config_update: &git_config_update
+  stage: git update
+  before_script: []
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - cd aac-inventory-config
+    - git config credential.helper "store --file=.git/credentials"
+    - echo "https://GIT_TOKEN:$GITHUB_TOKEN@10.50.223.165" > .git/credentials
+    - git config user.email $GITLAB_USER_EMAIL
+    - git config user.name $GITLAB_USER_NAME
+    - git add -A
+    - git commit -a -m "$CI_COMMIT_MESSAGE" --allow-empty
+    - git push
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+    expire_in: 30 min
+    when: always
+
+git config update (master branch):
+  <<: *git_config_update
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  dependencies:
+    - render apic (master branch)
+  needs: ["validate (master branch)", "render apic (master branch)", "deploy apic (master branch)"]
+
+git config update w. bootstrap (master branch):
+  <<: *git_config_update
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  dependencies:
+    - render apic w. bootstrap (master branch)
+  needs: ["validate (master branch)", "render apic w. bootstrap (master branch)", "deploy apic w. bootstrap (master branch)"]
+
+# Template for the GIT config update jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.git_tag_release: &git_tag_release
+  stage: git update
+  before_script: []
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - git config credential.helper "store --file=.git/credentials"
+    - echo "https://GIT_TOKEN:$GITHUB_TOKEN@10.50.223.165" > .git/credentials
+    - git config user.email $GITLAB_USER_EMAIL
+    - git config user.name $GITLAB_USER_NAME
+    # Add git remote to allow write operations, as the origin from the gitlab ci clone is read-only
+    - git remote add origin-write https://GIT_TOKEN:$GITHUB_TOKEN@10.50.223.165/$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME.git
+    - git push --delete origin-write last_deploy
+    - git tag -d last_deploy
+    - git tag last_deploy
+    - git push origin-write --tags
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - pipeline_failure.txt
+    expire_in: 30 min
+    when: always
+
+git tag release (master branch):
+  <<: *git_tag_release
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  dependencies:
+    - render apic (master branch)
+  needs: ["validate (master branch)", "render apic (master branch)", "deploy apic (master branch)", "test apic (master branch)"]
+
+git tag release w. bootstrap (master branch):
+  <<: *git_tag_release
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  needs: ["validate (master branch)", "render apic w. bootstrap (master branch)", "deploy apic w. bootstrap (master branch)", "test apic w. bootstrap (master branch)"]
+
+# Template for the prepare notify jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.prepare_notify: &prepare_notify
+  stage: notify
+  before_script: []
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - python3 .ci/render-wx.py
+    # Modify notification template to indicate pipeline success or failure
+    # This is done this way, as Gitlab CI do not have a build-in variable for the overall pipeline success
+    - if grep failed pipeline_failure.txt > /dev/null 2>&1; then sed -i 's/{{ build.status }}/failure/g' webex.txt; fi
+    - if [ ! -f pipeline_failure.txt ]; then sed -i 's/{{ build.status }}/success/g' webex.txt; fi
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  artifacts:
+    paths:
+      - webex.txt
+    expire_in: 10 min
+    when: always
+  when: always
+
+prepare notification (master branch):
+  <<: *prepare_notify
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  dependencies:
+    - validate (master branch)
+    - render apic (master branch)
+    - deploy apic (master branch)
+    - test apic (master branch)
+    - git config update (master branch)
+    - git tag release (master branch)
+  needs: ["validate (master branch)", "render apic (master branch)", "deploy apic (master branch)", "test apic (master branch)", "git config update (master branch)", "git tag release (master branch)"]
+
+prepare notification w. bootstrap (master branch):
+  <<: *prepare_notify
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  dependencies:
+    - validate (master branch)
+    - bootstrap (master branch)
+    - test bootstrap (master branch)
+    - render apic w. bootstrap (master branch)
+    - deploy apic w. bootstrap (master branch)
+    - test apic w. bootstrap (master branch)
+    - git config update w. bootstrap (master branch)
+    - git tag release w. bootstrap (master branch)
+  needs: ["validate (master branch)", "bootstrap (master branch)", "test bootstrap (master branch)", "render apic w. bootstrap (master branch)", "deploy apic w. bootstrap (master branch)", "test apic w. bootstrap (master branch)", "git config update w. bootstrap (master branch)", "git tag release w. bootstrap (master branch)"]
+
+prepare notification (feature branch):
+  <<: *prepare_notify
+  rules:
+    - if: $CI_COMMIT_BRANCH != "master" && ( $CI_PIPELINE_SOURCE != "tag" || $CI_PIPELINE_SOURCE != "merge_request_event")
+  dependencies:
+    - validate (feature branch)
+  needs: ["validate (feature branch)"]
+
+prepare notification (PR):
+  <<: *prepare_notify
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  dependencies:
+    - validate (PR)
+    - render apic (PR)
+  needs: ["validate (PR)", "render apic (PR)"]
+
+# Template for the webex notify jobs, as multiple jobs are needed due to Gitlab CIs need for identical rules
+.webex_notify: &webex_notify
+  stage: notify
+  image: ciscosso/drone-webex-team:v0.0.1
+  before_script: []
+  variables:
+    PLUGIN_ACCESS_TOKEN: $SPARK_ACCESS_TOKEN
+    PLUGIN_ROOM: 'moskrive ACI Build'
+    DRONE_REPO_OWNER: $CI_PROJECT_NAMESPACE
+    DRONE_REPO_NAME: $CI_PROJECT_NAME
+    DRONE_COMMIT_SHA: $CI_COMMIT_SHA
+    DRONE_COMMIT_BRANCH: $CI_COMMIT_BRANCH
+    DRONE_COMMIT_AUTHOR: $CI_COMMIT_AUTHOR
+    DRONE_COMMIT_AUTHOR_EMAIL: ''
+    DRONE_BUILD_NUMBER: $CI_PIPELINE_ID
+    DRONE_BUILD_STATUS: 'unknown'
+    DRONE_BUILD_LINK: $CI_PIPELINE_URL
+    DRONE_COMMIT_MESSAGE: $CI_COMMIT_MESSAGE
+    DRONE_COMMIT_LINK: $CI_REPOSITORY_URL
+  script:
+    - echo -e "\e[0Ksection_start:`date +%s`:script\r\e[0KExecuting script"
+    - IFS=""
+    - env PLUGIN_BODY=$(cat webex.txt) /bin/drone-spark
+    - echo -e "\e[0Ksection_end:`date +%s`:script\r\e[0K"
+  when: always
+
+webex notification (master branch):
+  <<: *webex_notify
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag"
+  dependencies:
+    - prepare notification (master branch)
+  needs: ["prepare notification (master branch)"]
+
+webex notification w. bootstrap (master branch):
+  <<: *webex_notify
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE != "tag" && $BOOTSTRAP == "true"
+  dependencies:
+    - prepare notification w. bootstrap (master branch)
+  needs: ["prepare notification w. bootstrap (master branch)"]
+
+webex notification (feature branch):
+  <<: *webex_notify
+  rules:
+    - if: $CI_COMMIT_BRANCH != "master" && ( $CI_PIPELINE_SOURCE != "tag" || $CI_PIPELINE_SOURCE != "merge_request_event")
+  dependencies:
+    - prepare notification (feature branch)
+  needs: ["prepare notification (feature branch)"]
+
+webex notification (PR):
+  <<: *webex_notify
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  dependencies:
+    - prepare notification (PR)
+  needs: ["prepare notification (PR)"]
+

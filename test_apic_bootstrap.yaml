@@ -1,0 +1,11 @@
+---
+- name: Test APIC Bootstrap
+  hosts: apic
+  gather_facts: no
+
+  tasks:
+    - name: APIC Bootstrap Tests
+      include_role:
+        name: cisco.aac.test_apic_bootstrap
+
+
